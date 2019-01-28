@@ -1,9 +1,12 @@
 local skynet = require "skynet"
+local core = require "skynet.core"
+require "skynet.manager"	-- import manager apis
 local string = string
 
 local services = {}
-
 local command = {}
+local instance = {} -- for confirm (function command.LAUNCH / command.ERROR / command.LAUNCHOK)
+local launch_session = {} -- for command.QUERY, service_address -> session
 
 local function handle_to_address(handle)
 	return tonumber("0x" .. string.sub(handle , 2))
@@ -19,54 +22,19 @@ function command.LIST()
 	return list
 end
 
-function command.RELOAD(handle)
-	handle = handle_to_address(handle)
-	local cmd = string.match(services[handle], "snlua (.+)")
-	print(services[handle],cmd)
-	if cmd then
-		skynet.send(handle,"debug","RELOAD",cmd)
-		return {cmd}
-	else
-		return {"Support only snlua"}
-	end
-end
-
 function command.STAT()
 	local list = {}
 	for k,v in pairs(services) do
-		local stat = skynet.call(k,"debug","STAT")
+		local ok, stat = pcall(skynet.call,k,"debug","STAT")
+		if not ok then
+			stat = string.format("ERROR (%s)",v)
+		end
 		list[skynet.address(k)] = stat
 	end
 	return list
 end
 
-function command.INFO(handle)
-	handle = handle_to_address(handle)
-	if services[handle] == nil then
-		return
-	else
-		local result = skynet.call(handle,"debug","INFO")
-		return result
-	end
-end
-
-function command.TIMING(handle)
-	handle = handle_to_address(handle)
-	if services[handle] == nil then
-		return
-	else
-		local r = skynet.call(handle,"debug","TIMING")
-		local result = {}
-		for k,v in pairs(r) do
-			v.name = services[k]
-			v.avg = v.ti/v.n
-			result[skynet.address(k)] = v
-		end
-		return result
-	end
-end
-
-function command.KILL(handle)
+function command.KILL(_, handle)
 	handle = handle_to_address(handle)
 	skynet.kill(handle)
 	local ret = { [skynet.address(handle)] = tostring(services[handle]) }
@@ -77,8 +45,12 @@ end
 function command.MEM()
 	local list = {}
 	for k,v in pairs(services) do
-		local kb, bytes = skynet.call(k,"debug","MEM")
-		list[skynet.address(k)] = string.format("%d Kb (%s)",kb,v)
+		local ok, kb, bytes = pcall(skynet.call,k,"debug","MEM")
+		if not ok then
+			list[skynet.address(k)] = string.format("ERROR (%s)",v)
+		else
+			list[skynet.address(k)] = string.format("%.2f Kb (%s)",kb,v)
+		end
 	end
 	return list
 end
@@ -90,48 +62,104 @@ function command.GC()
 	return command.MEM()
 end
 
-function command.REMOVE(handle)
+function command.REMOVE(_, handle, kill)
 	services[handle] = nil
+	local response = instance[handle]
+	if response then
+		-- instance is dead
+		response(not kill)	-- return nil to caller of newservice, when kill == false
+		instance[handle] = nil
+		launch_session[handle] = nil
+	end
+
 	-- don't return (skynet.ret) because the handle may exit
 	return NORET
 end
 
-local instance = {}
-
-skynet.dispatch("text" , function(session, address , cmd)
-	if cmd == "" then
-		-- init notice
-		local reply = instance[address]
-		if reply then
-			skynet.redirect(reply.address , 0, "response", reply.session, skynet.address(address))
-			instance[address] = nil
-		end
-	elseif cmd == "ERROR" then
-		-- see serivce-src/service_lua.c
-		-- init failed
-		local reply = instance[address]
-		if reply then
-			skynet.redirect(reply.address , 0, "response", reply.session, "")
-			instance[address] = nil
-		end
+local function launch_service(service, ...)
+	local param = table.concat({...}, " ")
+	local inst = skynet.launch(service, param)
+	local session = skynet.context()
+	local response = skynet.response()
+	if inst then
+		services[inst] = service .. " " .. param
+		instance[inst] = response
+		launch_session[inst] = session
 	else
-		-- launch request
-		local service, param = string.match(cmd,"([^ ]+) (.*)")
-		local inst = skynet.launch(service, param)
-		if inst then
-			services[inst] = cmd
-			instance[inst] = { session = session, address = address }
-		else
-			skynet.ret("")
+		response(false)
+		return
+	end
+	return inst
+end
+
+function command.LAUNCH(_, service, ...)
+	launch_service(service, ...)
+	return NORET
+end
+
+function command.LOGLAUNCH(_, service, ...)
+	local inst = launch_service(service, ...)
+	if inst then
+		core.command("LOGON", skynet.address(inst))
+	end
+	return NORET
+end
+
+function command.ERROR(address)
+	-- see serivce-src/service_lua.c
+	-- init failed
+	local response = instance[address]
+	if response then
+		response(false)
+		launch_session[address] = nil
+		instance[address] = nil
+	end
+	services[address] = nil
+	return NORET
+end
+
+function command.LAUNCHOK(address)
+	-- init notice
+	local response = instance[address]
+	if response then
+		response(true, address)
+		instance[address] = nil
+		launch_session[address] = nil
+	end
+
+	return NORET
+end
+
+function command.QUERY(_, request_session)
+	for address, session in pairs(launch_session) do
+		if session == request_session then
+			return address
 		end
 	end
-end)
+end
+
+-- for historical reasons, launcher support text command (for C service)
+
+skynet.register_protocol {
+	name = "text",
+	id = skynet.PTYPE_TEXT,
+	unpack = skynet.tostring,
+	dispatch = function(session, address , cmd)
+		if cmd == "" then
+			command.LAUNCHOK(address)
+		elseif cmd == "ERROR" then
+			command.ERROR(address)
+		else
+			error ("Invalid text command " .. cmd)
+		end
+	end,
+}
 
 skynet.dispatch("lua", function(session, address, cmd , ...)
 	cmd = string.upper(cmd)
 	local f = command[cmd]
 	if f then
-		local ret = f(...)
+		local ret = f(address, ...)
 		if ret ~= NORET then
 			skynet.ret(skynet.pack(ret))
 		end

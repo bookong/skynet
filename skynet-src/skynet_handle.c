@@ -9,6 +9,7 @@
 #include <string.h>
 
 #define DEFAULT_SLOT_SIZE 4
+#define MAX_SLOT_SIZE 0x40000000
 
 struct handle_name {
 	char * name;
@@ -38,8 +39,12 @@ skynet_handle_register(struct skynet_context *ctx) {
 	
 	for (;;) {
 		int i;
-		for (i=0;i<s->slot_size;i++) {
-			uint32_t handle = (i+s->handle_index) & HANDLE_MASK;
+		uint32_t handle = s->handle_index;
+		for (i=0;i<s->slot_size;i++,handle++) {
+			if (handle > HANDLE_MASK) {
+				// 0 is reserved
+				handle = 1;
+			}
 			int hash = handle & (s->slot_size-1);
 			if (s->slot[hash] == NULL) {
 				s->slot[hash] = ctx;
@@ -48,7 +53,6 @@ skynet_handle_register(struct skynet_context *ctx) {
 				rwlock_wunlock(&s->lock);
 
 				handle |= s->harbor;
-				skynet_context_init(ctx, handle);
 				return handle;
 			}
 		}
@@ -66,8 +70,9 @@ skynet_handle_register(struct skynet_context *ctx) {
 	}
 }
 
-void
+int
 skynet_handle_retire(uint32_t handle) {
+	int ret = 0;
 	struct handle_storage *s = H;
 
 	rwlock_wlock(&s->lock);
@@ -76,8 +81,8 @@ skynet_handle_retire(uint32_t handle) {
 	struct skynet_context * ctx = s->slot[hash];
 
 	if (ctx != NULL && skynet_context_handle(ctx) == handle) {
-		skynet_context_release(ctx);
 		s->slot[hash] = NULL;
+		ret = 1;
 		int i;
 		int j=0, n=s->name_count;
 		for (i=0; i<n; ++i) {
@@ -90,9 +95,18 @@ skynet_handle_retire(uint32_t handle) {
 			++j;
 		}
 		s->name_count = j;
+	} else {
+		ctx = NULL;
 	}
 
 	rwlock_wunlock(&s->lock);
+
+	if (ctx) {
+		// release ctx may call skynet_handle_* , so wunlock first.
+		skynet_context_release(ctx);
+	}
+
+	return ret;
 }
 
 void 
@@ -104,10 +118,14 @@ skynet_handle_retireall() {
 		for (i=0;i<s->slot_size;i++) {
 			rwlock_rlock(&s->lock);
 			struct skynet_context * ctx = s->slot[i];
+			uint32_t handle = 0;
+			if (ctx)
+				handle = skynet_context_handle(ctx);
 			rwlock_runlock(&s->lock);
-			if (ctx != NULL) {
-				++n;
-				skynet_handle_retire(skynet_context_handle(ctx));
+			if (handle != 0) {
+				if (skynet_handle_retire(handle)) {
+					++n;
+				}
 			}
 		}
 		if (n==0)
@@ -168,6 +186,7 @@ static void
 _insert_name_before(struct handle_storage *s, char *name, uint32_t handle, int before) {
 	if (s->name_count >= s->name_cap) {
 		s->name_cap *= 2;
+		assert(s->name_cap <= MAX_SLOT_SIZE);
 		struct handle_name * n = skynet_malloc(s->name_cap * sizeof(struct handle_name));
 		int i;
 		for (i=0;i<before;i++) {

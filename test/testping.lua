@@ -1,7 +1,8 @@
 local skynet = require "skynet"
-local snax = require "snax"
+local snax = require "skynet.snax"
 
 skynet.start(function()
+	skynet.trace()
 	local ps = snax.newservice ("pingserver", "hello world")
 	print(ps.req.ping("foobar"))
 	print(ps.post.hello())
@@ -24,6 +25,13 @@ end
 
 	]]))
 	print(ps.post.hello())
-	print(snax.kill(ps,"exit"))
+
+	local info = skynet.call(ps.handle, "debug", "INFO")
+
+	for name,v in pairs(info) do
+		print(string.format("%s\tcount:%d time:%f", name, v.count, v.time))
+	end
+
+	print(ps.post.exit("exit")) -- == snax.kill(ps, "exit")
 	skynet.exit()
 end)
